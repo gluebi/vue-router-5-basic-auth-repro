@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>vue-router 5 basic-auth repro</title>
+  </head>
+  <body>
+    <!--
+      Inline probe — runs synchronously during HTML parsing, before any module
+      loads. If the document URL retains userinfo at this point, the call below
+      will throw the SecurityError we are trying to reproduce. In current
+      desktop Chrome it does throw; in some Chromium builds (notably the
+      headless one Playwright ships) userinfo is stripped earlier and the call
+      succeeds — see README for details.
+    -->
+    <script>
+      try {
+        history.replaceState({}, '', location.protocol + '//' + location.host + '/')
+        var p = document.createElement('p')
+        p.id = 'inline-probe'
+        p.textContent = 'inline-probe: REPLACED OK (document URL has no userinfo at parse time)'
+        document.body.appendChild(p)
+      } catch (e) {
+        var p = document.createElement('p')
+        p.id = 'inline-probe'
+        p.style.color = 'red'
+        p.textContent = 'inline-probe: SecurityError — ' + e.message
+        document.body.appendChild(p)
+      }
+    </script>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

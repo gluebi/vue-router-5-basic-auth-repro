@@ -1,0 +1,6 @@
+node_modules
+dist
+.DS_Store
+.pnpm-store
+.playwright-mcp
+# console-*.log captured at repro time IS checked in; nothing else
