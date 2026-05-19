@@ -32,7 +32,11 @@ SecurityError: Failed to execute 'replaceState' on 'History':
   'http://test:test@localhost:8080/'.
 ```
 
-The throw escapes `createWebHistory` setup. In a plain SPA the page still renders (because the throw is during module init, not during a synchronous browser-API mount), but `useRouter()` and friends are undefined for any code that depends on them. In Nuxt, this cascades into `Context conflict` and `TypeError: Cannot read properties of undefined (reading 'beforeEach')` — see the companion Nuxt repro for the full chain.
+vue-router's existing `try / catch` inside `changeLocation` swallows the throw and falls back to `location[replace ? 'replace' : 'assign'](url)`. That `location.replace('http://localhost:8080/')` fires a full-page navigation to the userinfo-less URL — verified in real Chrome (private window) by the `Navigated to http://localhost:8080/` entry that follows the SecurityError in the console with **Preserve log** enabled.
+
+**User-visible symptom (real desktop Chrome):** the page reloads itself once on the first basic-auth-URL access. Subsequent visits use cached credentials → `document.URL` no longer has userinfo → no mismatch → no reload. The reload is silent unless DevTools is open with Preserve log on. This is the kind of bug that goes unnoticed on local dev but bites real users following a basic-auth link to a staging site or internal tool.
+
+**User-visible symptom (Playwright headless Chromium 148):** the `location.replace` fallback doesn't fire — the throw escapes router init, leaving `useRouter()` undefined for downstream code. Inside Nuxt this cascades into `Context conflict` and `TypeError: Cannot read properties of undefined (reading 'beforeEach')` (see [`gluebi/nuxt-44-basic-auth-repro`](https://github.com/gluebi/nuxt-44-basic-auth-repro) for the captured log). This is a more visible failure mode but probably not what end users hit — real Chrome quietly reloads.
 
 ## Reproduction shape
 
@@ -82,17 +86,33 @@ open -na "Google Chrome" --args --user-data-dir=/tmp/repro
 # then paste the URL into the address bar
 ```
 
+**Important — enable "Preserve log" in DevTools Console settings before reloading.** Without it, the location.replace fallback wipes the console within a frame of the throw and you'll see nothing.
+
 ### Expected behaviour
 
 - Console clean.
 - vue-router boots, `<RouterLink>` performs client-side navigation.
+- URL bar continues to show whatever was requested (modulo Chrome's normal address-bar stripping of credentials).
 
-### Actual behaviour (real desktop Chromium)
+### Actual behaviour (real desktop Chrome)
 
-- The `[probe] history.replaceState` log in DevTools shows vue-router calling `history.replaceState(state, '', 'http://localhost:8090/')` while `document.URL` still reflects the userinfo-bearing original URL.
-- The call throws `SecurityError: Failed to execute 'replaceState' on 'History': …` (full text quoted above).
-- The exception escapes `createWebHistory()` setup; `useRouter()` is undefined for any composable that runs after the throw.
-- The inline probe in `<head>`/`<body>` also throws and renders the red error paragraph instead of the green one.
+With Preserve log on, the console shows in order:
+
+```
+Navigated to http://test:test@localhost:8090/
+SecurityError: Failed to execute 'replaceState' on 'History':
+  A history state object with URL 'http://localhost:8090/' cannot be
+  created in a document with origin 'http://localhost:8090' and URL
+  'http://test:test@localhost:8090/'.
+    at … (assets/index-…js)
+Navigated to http://localhost:8090/
+```
+
+vue-router 5's initial `replaceState` throws; vue-router's `try/catch` falls back to `location.replace('http://localhost:8090/')`; the page reloads itself to the userinfo-less URL; the second boot succeeds and the console looks clean from then on. The user experience is "page mysteriously reloads when I open the basic-auth link the first time."
+
+### Actual behaviour (Playwright headless Chromium 148, captured here)
+
+`location.replace` doesn't kick in for reasons that aren't fully clear (possibly Playwright suppresses the implicit navigation, possibly Chromium headless handles the throw differently). Result: `useRouter()` is undefined for downstream code. In Nuxt this cascades into `Context conflict` and `TypeError: Cannot read properties of undefined (reading 'beforeEach')`. See the companion Nuxt repro for the captured log.
 
 ### Observed in this verification run (headless Chromium 148, via Playwright)
 
@@ -102,7 +122,40 @@ open -na "Google Chrome" --args --user-data-dir=/tmp/repro
 [WARNING] [probe] history.replaceState arg url = "http://localhost:8090/"   document.URL = "http://localhost:8090/"
 ```
 
-vue-router IS executing the call with the absolute, userinfo-less URL — the chain is exercised — but the headless Chromium build Playwright ships strips userinfo from the document URL **earlier** than desktop Chromium does, so the call does not mismatch and the SecurityError doesn't fire here. The exact same Chromium engine version (148) running the companion Nuxt repro **does** reproduce the crash, because Nuxt's heavier SSR-bundled boot hits the call site while userinfo is still in the document URL — see `console-errors-44.log` in [`gluebi/nuxt-44-basic-auth-repro`](https://github.com/gluebi/nuxt-44-basic-auth-repro) for the captured error. Real desktop Chrome reproduces the same SecurityError from this Vite repro too (per the original report).
+vue-router IS executing the call with the absolute, userinfo-less URL — the chain is exercised — but the headless Chromium build Playwright ships strips userinfo from the JS-visible `document.URL` accessor **earlier** than desktop Chromium does, so my JS-side instrumentation didn't observe userinfo at the moment of the call. The underlying `NavigationEntry` URL the History API checks against may still have it (see the Nuxt repro, where in this same Chromium engine version the SecurityError DOES fire). The inconsistency between what JS observes and what the security check enforces is itself a useful detail — it explains why this bug is so easy to miss in scripted reproductions.
+
+### Observed in real desktop Chrome (private window, fresh profile, Preserve log ON)
+
+This plain Vite SPA reproduces the bug in real Chrome. Captured console with Preserve log enabled:
+
+```
+Navigated to http://test:test@localhost:8090/
+SecurityError: Failed to execute 'replaceState' on 'History':
+  A history state object with URL 'http://localhost:8090/' cannot be
+  created in a document with origin 'http://localhost:8090' and URL
+  'http://test:test@localhost:8090/'.
+    at i (assets/index-…js:1:69905)
+    at ou (assets/index-…js:1:69658)
+    at lu (assets/index-…js:1:70326)
+    at  (assets/index-…js:1:87559)
+Navigated to http://localhost:8090/
+[probe] history.replaceState arg url = "http://localhost:8090/"   document.URL = "http://localhost:8090/"
+```
+
+Order of events:
+
+1. Chrome navigates to `http://test:test@localhost:8090/` — 401, retry with auth, document URL retains userinfo.
+2. The page parses; the inline-probe `<script>` runs at this point. In real Chrome the inline probe still says `REPLACED OK` — confirming the JS-side `document.URL` accessor doesn't expose userinfo to scripts, yet the underlying NavigationEntry the History API checks against does retain it. (This JS-vs-engine inconsistency is the most surprising part of the bug.)
+3. The Vite module bundle loads; vue-router's `createWebHistory()` calls `history.replaceState(state, '', 'http://localhost:8090/')` — third frame above (`lu`, the minified `changeLocation`).
+4. Chromium rejects → `SecurityError` (the bug).
+5. vue-router's `try/catch` catches the throw and runs `location.replace('http://localhost:8090/')` — visible as `Navigated to http://localhost:8090/`.
+6. Browser navigates; on the second boot, document URL no longer has userinfo, vue-router's `replaceState` succeeds (last line — the `[probe]` log from `src/main.js` is from this second boot).
+
+**Without Preserve log, all you see is the page reloading itself once on first navigation** — easy to dismiss as a network blip. The bug is real but quiet.
+
+### Observed in headless Chromium 148 via Playwright (captured here as `console-headless-chromium.log`)
+
+In this same Chromium engine version under Playwright headless, the JS-side `document.URL` accessor shows no userinfo from script start AND vue-router's `replaceState` succeeds — so the bug doesn't observably fire in this Vite SPA. The same headless build does fire the bug in the companion Nuxt repro, where the cascade (`Context conflict`, then `Cannot read properties of undefined (reading 'beforeEach')`) appears instead of `location.replace`. So Playwright headless is a poor harness for this particular bug — real desktop Chrome is the correct verification environment.
 
 ## Why a 401 challenge is required
 

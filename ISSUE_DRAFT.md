@@ -45,9 +45,21 @@ SecurityError: Failed to execute 'replaceState' on 'History':
   'http://test:test@localhost:8090/'.
 ```
 
-The throw escapes `useHistoryStateNavigation`'s top-level `if (!historyState.value) { changeLocation(..., true) }` setup. In a plain SPA this leaves `useRouter()` undefined; in Nuxt it cascades into `Context conflict` and `TypeError: Cannot read properties of undefined (reading 'beforeEach')`.
+vue-router's existing `try/catch` inside `changeLocation` then falls back to `location.replace('http://localhost:8090/')` — verified in real Chrome (private window, Preserve log on) by the captured console:
 
-The bug only fires on the **first** navigation that carries userinfo. Once Chrome caches credentials for the host, subsequent visits don't need a 401 → document URL no longer has userinfo → the call succeeds. This is why the bug is intermittent and easily missed during development but bites real users who follow a basic-auth link to a Vue/Nuxt app for the first time.
+```
+Navigated to http://test:test@localhost:8090/
+SecurityError: Failed to execute 'replaceState' on 'History': …
+Navigated to http://localhost:8090/
+```
+
+The user-visible result is that **the page reloads itself once on first navigation**, dropping the userinfo from the URL bar in the process. After the reload, the document URL has no userinfo and vue-router boots cleanly.
+
+This means the bug is silent unless DevTools is open with Preserve log enabled — which is why it slips through development. It bites real users who follow a basic-auth link (staging environments, internal tooling) for the first time: the page "mysteriously reloads itself," any client-side state set up before the reload is lost, and any in-flight client-side work that depended on the original URL is silently re-executed.
+
+The bug only fires on the **first** navigation that carries userinfo. Once Chrome caches credentials for the host, subsequent visits don't need a 401 → document URL no longer has userinfo → the call succeeds.
+
+**Subtlety worth flagging:** the JS `document.URL` accessor returns the userinfo-less form (`http://localhost:8090/`) even while the underlying NavigationEntry URL the History API checks against retains it. An inline `<script>` that pre-emptively calls `history.replaceState({}, '', location.protocol + '//' + location.host + '/')` in `<body>` succeeds at parse time, which makes it impossible for vue-router (or any user code) to detect this state from JS before issuing its own call. This is what makes the issue both tricky to reproduce in scripted harnesses and unintuitive to defend against in user code.
 
 ### Where the URL is built
 
